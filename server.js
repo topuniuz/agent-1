@@ -57,7 +57,7 @@ async function github(apiPath, options = {}) {
 }
 
 async function gemini(prompt) {
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+  const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
@@ -82,6 +82,18 @@ function safeBranchName(task) {
   return `agent-1/${slug}-${Date.now().toString(36)}`;
 }
 
+function log(job, message, status = null) {
+  job.events ||= [];
+  job.events.push({ at: Date.now(), message, status });
+  job.updatedAt = Date.now();
+}
+
+function setStatus(job, status, message = null) {
+  job.status = status;
+  job.updatedAt = Date.now();
+  if (message) log(job, message, status);
+}
+
 async function collectFiles(root) {
   const { stdout } = await run('git', ['ls-files'], root, 30000);
   return stdout.split('\n').map(x => x.trim()).filter(Boolean).filter(x => !/(^|\/)(node_modules|\.git|dist|build|coverage)(\/|$)/.test(x));
@@ -90,14 +102,14 @@ async function collectFiles(root) {
 async function readRelevantFiles(root, files) {
   const ranked = files.map(file => ({ file, score: /(^|\/)(package\.json|vite\.config|next\.config|src\/|app\/|pages\/|server|README|supabase|\.github\/)/i.test(file) ? 2 : 1 }));
   ranked.sort((a,b) => b.score-a.score || a.file.length-b.file.length);
-  const selected = ranked.slice(0, 80);
+  const selected = ranked.slice(0, 100);
   let total = 0;
   const chunks = [];
   for (const { file } of selected) {
     try {
       const content = await readFile(path.join(root, file), 'utf8');
       if (content.length > 30000) continue;
-      if (total + content.length > 220000) break;
+      if (total + content.length > 300000) break;
       chunks.push(`\n--- FILE: ${file} ---\n${content}`);
       total += content.length;
     } catch {}
@@ -141,10 +153,50 @@ async function mergePr(repository, number) {
   });
 }
 
+function getTestCommands(packageJson) {
+  const commands = [];
+  const scripts = packageJson?.scripts || {};
+  if (scripts.test) commands.push(['npm', ['test']]);
+  if (scripts.build) commands.push(['npm', ['run', 'build']]);
+  return commands.slice(0, 2);
+}
+
+async function runValidation(work) {
+  const pkgPath = path.join(work, 'package.json');
+  let packageJson = null;
+  try { packageJson = JSON.parse(await readFile(pkgPath, 'utf8')); } catch {}
+  const commands = getTestCommands(packageJson);
+  const testResults = [];
+  for (const [cmd, args] of commands) {
+    try {
+      const result = await run(cmd, args, work, 240000);
+      testResults.push({ command: [cmd, ...args].join(' '), ok: true, output: `${result.stdout || ''}\n${result.stderr || ''}`.slice(-12000) });
+    } catch (error) {
+      testResults.push({ command: [cmd, ...args].join(' '), ok: false, code: error.code ?? null, output: `${error.stdout || ''}\n${error.stderr || error.message}`.slice(-12000) });
+    }
+  }
+  return testResults;
+}
+
+async function repairFromValidation(job, work, files, snapshot, testResults) {
+  const failures = testResults.filter(x => !x.ok);
+  if (!failures.length) return [];
+  const changed = job.changedFiles || [];
+  const changedSnapshot = [];
+  for (const file of changed) {
+    try { changedSnapshot.push(`\n--- CHANGED FILE: ${file} ---\n${await readFile(path.join(work, file), 'utf8')}`); } catch {}
+  }
+  const repair = await gemini(`You are Agent 1 repairing your own code change. The project validation failed. Return JSON only with keys: summary, edits (array of {path, content}), risks, confidence. Fix only the failures while preserving the requested behavior and unrelated code. Do not change configuration merely to hide failures.\n\nTASK: ${job.task}\n\nFAILURES:\n${failures.map(x => `COMMAND: ${x.command}\nOUTPUT:\n${x.output}`).join('\n')}\n\nCHANGED FILES:\n${changedSnapshot.join('')}\n\nREPOSITORY FILES:\n${files.join('\n')}\n\nRELEVANT SNAPSHOT:\n${snapshot}`);
+  const repaired = await applyEdits(work, repair.edits || []);
+  if (repaired.length) job.changedFiles = [...new Set([...changed, ...repaired])];
+  job.repair = { summary: repair.summary || 'Applied a validation repair pass.', confidence: repair.confidence ?? null, files: repaired };
+  return repaired;
+}
+
 async function executeJob(job) {
-  job.status = 'cloning'; job.updatedAt = Date.now();
   const work = await mkdtemp(path.join(tmpdir(), 'agent1-'));
   try {
+    setStatus(job, 'cloning', 'cloning repository into isolated workspace');
     const repoUrl = `https://x-access-token:${encodeURIComponent(process.env.GITHUB_TOKEN)}@github.com/${job.repository}.git`;
     await run('git', ['clone', '--depth', '1', repoUrl, work], tmpdir(), 180000);
     const { stdout: currentSha } = await run('git', ['rev-parse', 'HEAD'], work, 30000);
@@ -153,60 +205,58 @@ async function executeJob(job) {
     job.baseSha = currentSha.trim();
 
     const files = await collectFiles(work);
-    job.status = 'analyzing'; job.fileCount = files.length; job.updatedAt = Date.now();
-    const snapshot = await readRelevantFiles(work, files);
-
-    const plan = await gemini(`You are Agent 1, a careful senior software engineer. Analyze this repository snapshot and the user's task. Return JSON only with keys: summary (string), risks (array of strings), relevantFiles (array of strings), edits (array of objects with path and content), tests (array of strings), confidence (number 0-1). Make the smallest safe change. Preserve unrelated functionality. Do not invent files. For research/test/audit tasks, edits may be empty. For code/bug tasks, provide complete contents only for files that must change.\n\nMODE: ${job.mode}\nTASK: ${job.task}\n\nREPOSITORY FILE LIST:\n${files.join('\n')}\n\nRELEVANT FILE SNAPSHOT:\n${snapshot.snapshot}`);
+    setStatus(job, 'analyzing', `analyzing repository structure and relevant source files (${files.length} files)`);
+    job.fileCount = files.length;
+    const snapshotData = await readRelevantFiles(work, files);
+    const plan = await gemini(`You are Agent 1, a careful senior software engineer. Analyze this repository snapshot and the user's task. Return JSON only with keys: summary (string), risks (array of strings), relevantFiles (array of strings), edits (array of objects with path and content), tests (array of strings), confidence (number 0-1). Make the smallest safe change. Preserve unrelated functionality. Do not invent files. For research/test/audit tasks, edits may be empty. For code/bug tasks, provide complete contents only for files that must change.\n\nMODE: ${job.mode}\nTASK: ${job.task}\n\nREPOSITORY FILE LIST:\n${files.join('\n')}\n\nRELEVANT FILE SNAPSHOT:\n${snapshotData.snapshot}`);
     job.plan = { summary: plan.summary, risks: plan.risks || [], relevantFiles: plan.relevantFiles || [], confidence: plan.confidence ?? null };
 
     if (job.action === 'analyze') {
-      job.status = 'ready_for_review'; job.updatedAt = Date.now(); return;
+      setStatus(job, 'analysis_complete', 'analysis complete; no files modified and no pull request created');
+      return;
     }
 
-    job.status = 'editing'; job.updatedAt = Date.now();
+    setStatus(job, 'editing', 'Gemini produced a plan; applying targeted edits');
     const changed = await applyEdits(work, plan.edits || []);
-    if (!changed.length) {
-      job.status = 'ready_for_review'; job.changedFiles = []; job.updatedAt = Date.now(); return;
-    }
     job.changedFiles = changed;
-
-    job.status = 'testing'; job.updatedAt = Date.now();
-    const pkgPath = path.join(work, 'package.json');
-    let packageJson = null;
-    try { packageJson = JSON.parse(await readFile(pkgPath, 'utf8')); } catch {}
-    const commands = [];
-    if (packageJson?.scripts?.test) commands.push(['npm', ['test', '--', '--runInBand']]);
-    if (packageJson?.scripts?.build) commands.push(['npm', ['run', 'build']]);
-    const testResults = [];
-    for (const [cmd, args] of commands.slice(0, 2)) {
-      try { const result = await run(cmd, args, work, 240000); testResults.push({ command: [cmd, ...args].join(' '), ok: true, output: result.stdout.slice(-5000) }); }
-      catch (error) { testResults.push({ command: [cmd, ...args].join(' '), ok: false, output: `${error.stdout || ''}\n${error.stderr || error.message}`.slice(-7000) }); }
-    }
-    job.tests = testResults;
-    if (testResults.some(x => !x.ok)) {
-      job.status = 'failed'; job.error = 'Validation failed. No branch was published to main.'; job.updatedAt = Date.now(); return;
+    if (!changed.length) {
+      setStatus(job, 'analysis_complete', 'no changes were required; no branch or pull request created');
+      return;
     }
 
-    job.status = 'publishing_branch'; job.updatedAt = Date.now();
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      setStatus(job, 'testing', attempt === 1 ? 'running project tests and build validation' : `validation failed; running repair pass ${attempt - 1}/2`);
+      job.tests = await runValidation(work);
+      if (!job.tests.some(x => !x.ok)) break;
+      if (attempt === 3) {
+        job.error = 'Validation failed after two repair attempts. No branch or pull request was published.';
+        setStatus(job, 'failed', 'execution failed — validation still failing; no main publication');
+        return;
+      }
+      await repairFromValidation(job, work, files, snapshotData.snapshot, job.tests);
+    }
+
+    setStatus(job, 'publishing_branch', 'tests passed; creating agent branch and publishing review commit');
     job.branch = safeBranchName(job.task);
     await run('git', ['checkout', '-b', job.branch], work, 30000);
     await run('git', ['config', 'user.name', 'Agent 1'], work, 30000);
     await run('git', ['config', 'user.email', 'agent-1@users.noreply.github.com'], work, 30000);
-    await run('git', ['add', ...changed], work, 30000);
+    await run('git', ['add', ...job.changedFiles], work, 30000);
     await run('git', ['commit', '-m', `feat(agent-1): ${job.task.slice(0, 60)}`], work, 60000);
     await run('git', ['push', '-u', 'origin', job.branch], work, 120000);
 
     const pr = await createPr(job.repository, job.branch, job.baseBranch, job.task, plan.summary || 'Agent 1 completed a reviewable change.');
     job.pr = { number: pr.number, url: pr.html_url, title: pr.title };
-    job.status = 'ready_for_review'; job.updatedAt = Date.now();
+    setStatus(job, 'ready_for_review', 'validation complete; GitHub PR is ready for your review');
   } catch (error) {
-    job.status = 'failed'; job.error = error.message; job.updatedAt = Date.now();
+    job.error = error.message;
+    setStatus(job, 'failed', `execution failed — ${error.message}`);
   } finally {
     await rm(work, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'agent-1', version: '0.3.0' }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'agent-1', version: '0.4.0' }));
 app.get('/api/config', auth, (_req, res) => res.json({
   modes,
   actions: [
@@ -233,8 +283,9 @@ app.post('/api/tasks', auth, async (req, res) => {
   if (!task || typeof task !== 'string') return res.status(400).json({ error: 'Task description is required' });
   if (!requireIntegrations(res)) return;
   const id = crypto.randomUUID();
-  const job = { id, mode, repository, action, task: task.slice(0, 10000), status: 'queued', createdAt: Date.now(), updatedAt: Date.now() };
+  const job = { id, mode, repository, action, task: task.slice(0, 10000), status: 'queued', createdAt: Date.now(), updatedAt: Date.now(), events: [] };
   jobs.set(id, job);
+  log(job, 'job accepted');
   executeJob(job);
   res.status(202).json({ jobId: id, status: job.status, message: 'Agent 1 started. It will analyze the full repository, make only required changes, run validation, and create a reviewable branch/PR.' });
 });
@@ -250,17 +301,24 @@ app.post('/api/jobs/:id/approve', auth, async (req, res) => {
   if (!job) return res.status(404).json({ error: 'Job not found.' });
   if (job.status !== 'ready_for_review' || !job.pr?.number) return res.status(409).json({ error: 'Job is not ready for approval.' });
   try {
-    job.status = 'publishing'; job.updatedAt = Date.now();
+    setStatus(job, 'publishing', 'approval received; merging approved PR into main');
     const result = await mergePr(job.repository, job.pr.number);
-    job.status = result.merged ? 'published' : 'failed'; job.merge = result; job.updatedAt = Date.now();
+    job.status = result.merged ? 'published' : 'failed';
+    job.merge = result;
+    log(job, result.merged ? 'published successfully to main' : 'GitHub did not merge the pull request', result.merged ? 'published' : 'failed');
     res.json(job);
-  } catch (error) { job.status = 'failed'; job.error = error.message; job.updatedAt = Date.now(); res.status(502).json({ error: error.message, job }); }
+  } catch (error) {
+    job.error = error.message;
+    setStatus(job, 'failed', `publish failed — ${error.message}`);
+    res.status(502).json({ error: error.message, job });
+  }
 });
 
 app.post('/api/jobs/:id/cancel', auth, async (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found.' });
   job.status = 'cancelled'; job.updatedAt = Date.now();
+  log(job, 'job cancelled');
   if (job.pr?.number) {
     try { await github(`/repos/${job.repository}/pulls/${job.pr.number}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state: 'closed' }) }); } catch {}
   }
@@ -274,8 +332,8 @@ app.post('/api/jobs/:id/revise', auth, async (req, res) => {
   if (job.pr?.number) { try { await github(`/repos/${job.repository}/pulls/${job.pr.number}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state: 'closed' }) }); } catch {} }
   const next = { mode: job.mode, repository: job.repository, action: 'preview', task: `${job.task}\n\nREVISION REQUEST:\n${String(instruction).slice(0, 5000)}` };
   const id = crypto.randomUUID();
-  const fresh = { id, ...next, status: 'queued', createdAt: Date.now(), updatedAt: Date.now() };
-  jobs.set(id, fresh); executeJob(fresh);
+  const fresh = { id, ...next, status: 'queued', createdAt: Date.now(), updatedAt: Date.now(), events: [] };
+  jobs.set(id, fresh); log(fresh, 'revision accepted'); executeJob(fresh);
   res.status(202).json({ jobId: id, message: 'Revision started.' });
 });
 
