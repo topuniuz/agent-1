@@ -39,8 +39,7 @@ const planSchema = {
     tests: { type: 'array', items: { type: 'string' } },
     confidence: { type: 'number', minimum: 0, maximum: 1 }
   },
-  required: ['summary', 'risks', 'relevantFiles', 'edits', 'tests', 'confidence'],
-  additionalProperties: false
+  required: ['summary', 'risks', 'relevantFiles', 'edits', 'tests', 'confidence']
 };
 
 const repairSchema = {
@@ -51,8 +50,7 @@ const repairSchema = {
     risks: { type: 'array', items: { type: 'string' } },
     confidence: { type: 'number', minimum: 0, maximum: 1 }
   },
-  required: ['summary', 'edits', 'risks', 'confidence'],
-  additionalProperties: false
+  required: ['summary', 'edits', 'risks', 'confidence']
 };
 
 function requireIntegrations(res) {
@@ -91,10 +89,7 @@ async function gemini(prompt, schema) {
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
       body: JSON.stringify({
         contents: [{ parts: [{ text: `${prompt}${extraPrompt}` }] }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          responseSchema: schema
-        }
+        generationConfig: { responseMimeType: 'application/json', responseSchema: schema }
       })
     });
     const data = await response.json();
@@ -105,16 +100,9 @@ async function gemini(prompt, schema) {
   };
 
   let result = await makeRequest();
-  try {
-    return JSON.parse(result.text);
-  } catch {
-    result = await makeRequest('\n\nIMPORTANT: return ONLY a valid JSON object matching the response schema. Do not include markdown, code fences, or commentary.');
-    try {
-      return JSON.parse(result.text);
-    } catch {
-      throw new Error('Gemini returned invalid structured output after retry.');
-    }
-  }
+  try { return JSON.parse(result.text); } catch {}
+  result = await makeRequest('\n\nIMPORTANT: return ONLY a valid JSON object matching the response schema. Do not include markdown, code fences, or commentary.');
+  try { return JSON.parse(result.text); } catch { throw new Error('Gemini returned invalid structured output after retry.'); }
 }
 
 async function run(cmd, args, cwd, timeout = 120000) {
@@ -180,23 +168,13 @@ async function createPr(repository, branch, base, task, summary) {
   return github(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      title: `Agent 1: ${task.slice(0, 70)}`,
-      head: branch,
-      base,
-      body: `## Agent 1\n\n${summary}\n\nThis branch was created by Agent 1 for review. It is not published to main automatically.`,
-      draft: false
-    })
+    body: JSON.stringify({ title: `Agent 1: ${task.slice(0, 70)}`, head: branch, base, body: `## Agent 1\n\n${summary}\n\nThis branch was created by Agent 1 for review. It is not published to main automatically.`, draft: false })
   });
 }
 
 async function mergePr(repository, number) {
   const [owner, repo] = repository.split('/');
-  return github(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}/merge`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ merge_method: 'squash' })
-  });
+  return github(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}/merge`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merge_method: 'squash' }) });
 }
 
 function getTestCommands(packageJson) {
@@ -296,29 +274,23 @@ async function executeJob(job) {
     setStatus(job, 'ready_for_review', 'validation complete; GitHub PR is ready for your review');
   } catch (error) {
     job.error = error.message;
-    setStatus(job, 'failed', `execution failed — ${error.message}`);
+    const userSafe = /Gemini|structured|JSON|response/i.test(error.message) ? 'Agent 1 could not get a usable AI response. Nothing was changed or published.' : error.message;
+    job.userMessage = userSafe;
+    setStatus(job, 'failed', 'Agent stopped safely; no repository publication occurred');
   } finally {
     await rm(work, { recursive: true, force: true }).catch(() => {});
   }
 }
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'agent-1', version: '0.5.0' }));
-app.get('/api/config', auth, (_req, res) => res.json({
-  modes,
-  actions: [
-    { id: 'analyze', label: 'Analyze' },
-    { id: 'preview', label: 'Implement + Preview' },
-    { id: 'publish', label: 'Approve → Main' }
-  ],
-  integrations: { github: Boolean(process.env.GITHUB_TOKEN), gemini: Boolean(process.env.GEMINI_API_KEY), render: Boolean(process.env.RENDER_API_KEY) }
-}));
+app.get('/api/config', auth, (_req, res) => res.json({ modes, actions: [{ id: 'analyze', label: 'Analyze' }, { id: 'preview', label: 'Implement + Preview' }, { id: 'publish', label: 'Approve → Main' }], integrations: { github: Boolean(process.env.GITHUB_TOKEN), gemini: Boolean(process.env.GEMINI_API_KEY), render: Boolean(process.env.RENDER_API_KEY) } }));
 
 app.get('/api/repositories', auth, async (_req, res) => {
   if (!process.env.GITHUB_TOKEN) return res.status(503).json({ error: 'GITHUB_TOKEN is not configured.' });
   try {
     const repositories = await github('/user/repos?per_page=100&affiliation=owner,collaborator,organization_member&sort=updated');
     res.json({ repositories: repositories.map(repo => ({ id: repo.id, name: repo.name, full_name: repo.full_name, private: repo.private, default_branch: repo.default_branch, permissions: repo.permissions || {} })) });
-  } catch (error) { res.status(502).json({ error: error.message }); }
+  } catch (error) { res.status(502).json({ error: 'GitHub repository discovery is temporarily unavailable.' }); }
 });
 
 app.post('/api/tasks', auth, async (req, res) => {
@@ -355,8 +327,8 @@ app.post('/api/jobs/:id/approve', auth, async (req, res) => {
     res.json(job);
   } catch (error) {
     job.error = error.message;
-    setStatus(job, 'failed', `publish failed — ${error.message}`);
-    res.status(502).json({ error: error.message, job });
+    setStatus(job, 'failed', 'Publish did not complete; main was not changed by Agent 1.');
+    res.status(502).json({ error: 'Publish did not complete. The PR remains available for review.', job });
   }
 });
 
@@ -376,9 +348,7 @@ app.post('/api/jobs/:id/revise', auth, async (req, res) => {
   const job = jobs.get(req.params.id);
   const instruction = req.body?.instruction;
   if (!job || !instruction) return res.status(400).json({ error: 'Job and revision instruction are required.' });
-  if (job.pr?.number) {
-    try { await github(`/repos/${job.repository}/pulls/${job.pr.number}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state: 'closed' }) }); } catch {}
-  }
+  if (job.pr?.number) { try { await github(`/repos/${job.repository}/pulls/${job.pr.number}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state: 'closed' }) }); } catch {} }
   const next = { mode: job.mode, repository: job.repository, action: 'preview', task: `${job.task}\n\nREVISION REQUEST:\n${String(instruction).slice(0, 5000)}` };
   const id = crypto.randomUUID();
   const fresh = { id, ...next, status: 'queued', createdAt: Date.now(), updatedAt: Date.now(), events: [] };
