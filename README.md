@@ -15,3 +15,6 @@ Agent 1 analyzes repositories before editing, makes minimal changes, runs valida
 
 ## Environment variables
 See `.env.example`. Do not commit real credentials.
+
+## Runtime
+Uses structured Gemini responses with schema validation before repository edits.
