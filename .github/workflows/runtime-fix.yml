@@ -1,0 +1,57 @@
+name: Agent 1 runtime fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch runtime
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('server.js')
+          s = p.read_text()
+
+          helper = '''\nasync function installDependencies(work) {\n  const pkgPath = path.join(work, 'package.json');\n  try { JSON.parse(await readFile(pkgPath, 'utf8')); } catch { return null; }\n  const lockExists = await readFile(path.join(work, 'package-lock.json'), 'utf8').then(() => true).catch(() => false);\n  return lockExists ? ['npm', ['ci', '--no-audit', '--no-fund']] : ['npm', ['install', '--no-audit', '--no-fund']];\n}\n\nfunction changedFilesAreScoped(changedFiles, task) {\n  const packageChanges = changedFiles.filter(file => ['package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'].includes(file));\n  if (!packageChanges.length) return true;\n  return /(dependenc|package|npm|install|upgrade|downgrade|library|framework|vite|react|next\\.js|typescript)/i.test(String(task || ''));\n}\n'''
+          marker = "async function run(cmd, args, cwd, timeout = 120000) {"
+          if 'async function installDependencies(work)' not in s:
+              s = s.replace(marker, helper + marker, 1)
+
+          old = """    const files = await collectFiles(work);\n    setStatus(job, 'analyzing', `analyzing repository structure and relevant source files (${files.length} files)`);"""
+          new = """    const files = await collectFiles(work);\n    const dependencyCommand = await installDependencies(work);\n    if (dependencyCommand) {\n      const [depCmd, depArgs] = dependencyCommand;\n      setStatus(job, 'installing', `installing project dependencies with ${depCmd} ${depArgs.join(' ')}`);\n      try { await run(depCmd, depArgs, work, 300000); } catch {\n        job.error = 'Dependency installation failed. Nothing was published.';\n        setStatus(job, 'failed', 'dependency installation failed — no branch or pull request created');\n        return;\n      }\n    }\n    setStatus(job, 'analyzing', `analyzing repository structure and relevant source files (${files.length} files)`);"""
+          if old not in s:
+              raise SystemExit('analysis marker not found')
+          s = s.replace(old, new, 1)
+
+          old = """    const changed = await applyEdits(work, plan.edits || []);\n    job.changedFiles = changed;\n    if (!changed.length) {"""
+          new = """    const changed = await applyEdits(work, plan.edits || []);\n    if (!changedFilesAreScoped(changed, job.task)) {\n      job.error = 'Unrelated package/configuration changes were rejected for safety.';\n      setStatus(job, 'failed', 'blocked unrelated package/configuration edits — no branch or pull request created');\n      return;\n    }\n    job.changedFiles = changed;\n    if (!changed.length) {"""
+          if old not in s:
+              raise SystemExit('edit marker not found')
+          s = s.replace(old, new, 1)
+
+          old = """  } catch (error) {\n    job.error = error.message;\n    setStatus(job, 'failed', `execution failed — ${error.message}`);\n  } finally {"""
+          new = """  } catch (error) {\n    job.error = error.message;\n    job.userMessage = 'Agent 1 stopped safely. Nothing was published.';\n    setStatus(job, 'failed', 'Agent stopped safely; no repository publication occurred');\n  } finally {"""
+          if old not in s:
+              raise SystemExit('error marker not found')
+          s = s.replace(old, new, 1)
+
+          p.write_text(s)
+      - name: Validate runtime
+        run: node --check server.js
+      - name: Commit runtime fix
+        shell: bash
+        run: |
+          git config user.name 'Agent 1'
+          git config user.email 'agent-1@users.noreply.github.com'
+          git add server.js
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: install dependencies and block unrelated edits'
+          git push
