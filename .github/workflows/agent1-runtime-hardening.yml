@@ -1,0 +1,63 @@
+name: Agent 1 runtime hardening
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch runtime safely
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('server.js')
+          s = p.read_text()
+          marker = "async function run(cmd, args, cwd, timeout = 120000) {"
+          helper = '''
+async function installDependencies(work) {
+  const pkgPath = path.join(work, 'package.json');
+  try { JSON.parse(await readFile(pkgPath, 'utf8')); } catch { return null; }
+  const lockExists = await readFile(path.join(work, 'package-lock.json'), 'utf8').then(() => true).catch(() => false);
+  return lockExists ? ['npm', ['ci', '--no-audit', '--no-fund']] : ['npm', ['install', '--no-audit', '--no-fund']];
+}
+
+function changedFilesAreScoped(changedFiles, task) {
+  const packageChanges = changedFiles.filter(file => ['package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'].includes(file));
+  if (!packageChanges.length) return true;
+  return /(dependenc|package|npm|install|upgrade|downgrade|library|framework|vite|react|next\\.js|typescript)/i.test(String(task || ''));
+}
+'''
+          if 'async function installDependencies(work)' not in s:
+              s = s.replace(marker, helper + '\n' + marker, 1)
+          old = "    const files = await collectFiles(work);\n    setStatus(job, 'analyzing', `analyzing repository structure and relevant source files (${files.length} files)`);"
+          new = "    const files = await collectFiles(work);\n    const dependencyCommand = await installDependencies(work);\n    if (dependencyCommand) {\n      const [depCmd, depArgs] = dependencyCommand;\n      setStatus(job, 'installing', `installing project dependencies with ${depCmd} ${depArgs.join(' ')}`);\n      try { await run(depCmd, depArgs, work, 300000); } catch { job.error = 'Dependency installation failed. No repository changes were published.'; setStatus(job, 'failed', 'dependency installation failed — no branch or pull request created'); return; }\n    }\n    setStatus(job, 'analyzing', `analyzing repository structure and relevant source files (${files.length} files)`);"
+          if old not in s: raise SystemExit('analysis marker not found')
+          s = s.replace(old, new, 1)
+          old2 = "    const changed = await applyEdits(work, plan.edits || []);\n    job.changedFiles = changed;\n    if (!changed.length) {"
+          new2 = "    const changed = await applyEdits(work, plan.edits || []);\n    if (!changedFilesAreScoped(changed, job.task)) { job.error = 'Unrelated package/configuration changes were rejected for safety.'; setStatus(job, 'failed', 'blocked unrelated package/configuration edits — no branch or pull request created'); return; }\n    job.changedFiles = changed;\n    if (!changed.length) {"
+          if old2 not in s: raise SystemExit('edit marker not found')
+          s = s.replace(old2, new2, 1)
+          old3 = "  } catch (error) {\n    job.error = error.message;\n    setStatus(job, 'failed', `execution failed — ${error.message}`);\n  } finally {"
+          new3 = "  } catch (error) {\n    job.error = error.message;\n    setStatus(job, 'failed', 'Agent 1 stopped safely. No main publication was made.');\n    log(job, 'The runtime encountered a problem and stopped without publishing changes.', 'error');\n  } finally {"
+          if old3 not in s: raise SystemExit('error marker not found')
+          s = s.replace(old3, new3, 1)
+          p.write_text(s)
+      - name: Validate runtime
+        run: node --check server.js
+      - name: Commit hardening and remove workflow
+        shell: bash
+        run: |
+          git config user.name 'Agent 1'
+          git config user.email 'agent-1@users.noreply.github.com'
+          git add server.js
+          git rm .github/workflows/agent1-runtime-hardening.yml
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: install dependencies and block unrelated agent edits'
+          git push
