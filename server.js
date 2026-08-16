@@ -15,53 +15,98 @@ function auth(req, res, next) {
 
 const modes = [
   { id: 'research', label: 'Research', description: 'Research and verify information before proposing changes.' },
-  { id: 'code', label: 'Code', description: 'Inspect a repository and implement a focused engineering task.' },
+  { id: 'code', label: 'Code', description: 'Inspect the repository and implement a focused engineering task.' },
   { id: 'bug', label: 'Fix Bug', description: 'Reproduce, diagnose, fix, and validate a bug.' },
   { id: 'test', label: 'Test', description: 'Audit builds, tests, routes, and likely regressions.' },
   { id: 'data', label: 'University Data', description: 'Research, normalize, validate, and prepare university records.' },
   { id: 'audit', label: 'Audit', description: 'Review architecture, security, UX, data, and technical debt.' }
 ];
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'agent-1', version: '0.1.0' }));
+function requireIntegrations(res) {
+  const missing = [];
+  if (!process.env.GITHUB_TOKEN) missing.push('GITHUB_TOKEN');
+  if (!process.env.GEMINI_API_KEY) missing.push('GEMINI_API_KEY');
+  if (missing.length) {
+    res.status(503).json({
+      status: 'configuration_required',
+      message: 'Agent runtime is ready. Add the required environment variables before executing repository work.',
+      missing
+    });
+    return false;
+  }
+  return true;
+}
+
+async function github(path, options = {}) {
+  const response = await fetch(`https://api.github.com${path}`, {
+    ...options,
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...(options.headers || {})
+    }
+  });
+  const text = await response.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { message: text }; }
+  if (!response.ok) throw new Error(data.message || `GitHub request failed (${response.status})`);
+  return data;
+}
+
+app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'agent-1', version: '0.2.0' }));
+
 app.get('/api/config', auth, (_req, res) => res.json({
   modes,
-  repositories: [
-    { id: 'topuni', label: 'TopUni', repo: `${process.env.GITHUB_OWNER || 'topuniuz'}/${process.env.TOPUNI_REPO || 'topuni'}` },
-    { id: 'topapp', label: 'TopApp', repo: `${process.env.GITHUB_OWNER || 'topuniuz'}/${process.env.TOPAPP_REPO || 'topapp'}` },
-    { id: 'both', label: 'Both', repo: 'TopUni + TopApp' }
-  ],
   actions: [
-    { id: 'analyze', label: 'Analyze only' },
-    { id: 'modify', label: 'Make changes' },
-    { id: 'test', label: 'Make + test' },
-    { id: 'commit', label: 'Make + test + commit' },
-    { id: 'push', label: 'Make + test + commit + push to main' }
+    { id: 'analyze', label: 'Analyze' },
+    { id: 'preview', label: 'Implement + Preview' },
+    { id: 'publish', label: 'Approve → Main' }
   ],
   integrations: { github: Boolean(process.env.GITHUB_TOKEN), gemini: Boolean(process.env.GEMINI_API_KEY) }
 }));
 
-// This first release is intentionally a safe control-plane shell. AI/GitHub execution is enabled only
-// after credentials are configured and the operator explicitly chooses an action level.
+app.get('/api/repositories', auth, async (_req, res) => {
+  if (!process.env.GITHUB_TOKEN) return res.status(503).json({ error: 'GITHUB_TOKEN is not configured.' });
+  try {
+    const repositories = await github('/user/repos?per_page=100&affiliation=owner,collaborator,organization_member&sort=updated');
+    res.json({ repositories: repositories.map(repo => ({
+      id: repo.id,
+      name: repo.name,
+      full_name: repo.full_name,
+      private: repo.private,
+      default_branch: repo.default_branch,
+      permissions: repo.permissions || {}
+    })) });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
 app.post('/api/tasks', auth, async (req, res) => {
   const { mode, repository, action, task } = req.body || {};
   if (!modes.some(m => m.id === mode)) return res.status(400).json({ error: 'Invalid mode' });
-  if (!['topuni', 'topapp', 'both'].includes(repository)) return res.status(400).json({ error: 'Invalid repository' });
-  if (!['analyze', 'modify', 'test', 'commit', 'push'].includes(action)) return res.status(400).json({ error: 'Invalid action' });
+  if (!repository || typeof repository !== 'string' || !repository.includes('/')) return res.status(400).json({ error: 'Select a repository' });
+  if (!['analyze', 'preview', 'publish'].includes(action)) return res.status(400).json({ error: 'Invalid action' });
   if (!task || typeof task !== 'string') return res.status(400).json({ error: 'Task description is required' });
+  if (!requireIntegrations(res)) return;
 
-  const missing = [];
-  if (!process.env.GITHUB_TOKEN) missing.push('GITHUB_TOKEN');
-  if (!process.env.GEMINI_API_KEY) missing.push('GEMINI_API_KEY');
-  if (missing.length) return res.status(503).json({
-    status: 'configuration_required',
-    message: 'Agent runtime is ready. Add the required environment variables before executing repository work.',
-    missing
-  });
+  // Repository execution is deliberately gated. The next engine phase will clone the selected
+  // repository, let Gemini plan/apply the minimal patch, run validation, and create a reviewable
+  // preview. Publishing to main will require a separate explicit approval action.
+  if (action === 'publish') {
+    return res.status(409).json({
+      status: 'approval_required',
+      message: 'Publishing is a separate approval step. First create and review the preview for this task.'
+    });
+  }
 
   res.status(202).json({
     status: 'queued',
     task: { mode, repository, action, description: task },
-    message: 'Execution engine is configured for this task. The next runtime phase will analyze the repository before making any change.'
+    message: action === 'analyze'
+      ? 'Repository selected. Analysis job is ready to run.'
+      : 'Preview job is ready. Agent will analyze the full repository before editing and will not publish to main automatically.'
   });
 });
 
