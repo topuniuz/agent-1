@@ -1,0 +1,76 @@
+name: Harden Agent 1 execution
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch runtime
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('server.js')
+          s = p.read_text()
+
+          old_apply = """async function applyEdits(root, edits) {\n  const changed = [];\n  for (const edit of edits || []) {\n    if (!edit?.path || typeof edit.content !== 'string') continue;\n    const normalized = path.normalize(edit.path);\n    if (normalized.startsWith('..') || path.isAbsolute(normalized)) throw new Error(`Unsafe edit path: ${edit.path}`);\n    if (normalized.includes('node_modules') || normalized === '.git') throw new Error(`Blocked edit path: ${edit.path}`);\n    const target = path.join(root, normalized);\n    await writeFile(target, edit.content, 'utf8');\n    changed.push(normalized);\n  }\n  return [...new Set(changed)];\n}\n"""
+          new_apply = """async function applyEdits(root, edits, allowDependencyFiles = false) {\n  const changed = [];\n  const protectedDependency = /(^|\\/)(package\\.json|package-lock\\.json|npm-shrinkwrap\\.json|pnpm-lock\\.yaml|yarn\\.lock)$/i;\n  for (const edit of edits || []) {\n    if (!edit?.path || typeof edit.content !== 'string') continue;\n    const normalized = path.normalize(edit.path);\n    if (normalized.startsWith('..') || path.isAbsolute(normalized)) throw new Error(`Unsafe edit path: ${edit.path}`);\n    if (normalized.includes('node_modules') || normalized === '.git') throw new Error(`Blocked edit path: ${edit.path}`);\n    if (protectedDependency.test(normalized) && !allowDependencyFiles) continue;\n    const target = path.join(root, normalized);\n    await writeFile(target, edit.content, 'utf8');\n    changed.push(normalized);\n  }\n  return [...new Set(changed)];\n}\n"""
+          if old_apply not in s:
+              raise SystemExit('applyEdits block not found')
+          s = s.replace(old_apply, new_apply, 1)
+
+          anchor = """function getTestCommands(packageJson) {\n"""
+          helper = """async function installDependencies(work) {\n  const exists = async (name) => { try { await readFile(path.join(work, name)); return true; } catch { return false; } };\n  if (!(await exists('package.json'))) return null;\n  if (await exists('pnpm-lock.yaml')) {\n    try { await run('corepack', ['pnpm', 'install', '--frozen-lockfile'], work, 300000); return 'pnpm install --frozen-lockfile'; }\n    catch { await run('npm', ['install'], work, 300000); return 'npm install (fallback)'; }\n  }\n  if (await exists('yarn.lock')) {\n    try { await run('corepack', ['yarn', 'install', '--immutable'], work, 300000); return 'yarn install --immutable'; }\n    catch { await run('npm', ['install'], work, 300000); return 'npm install (fallback)'; }\n  }\n  if (await exists('package-lock.json') || await exists('npm-shrinkwrap.json')) {\n    await run('npm', ['ci'], work, 300000);\n    return 'npm ci';\n  }\n  await run('npm', ['install'], work, 300000);\n  return 'npm install';\n}\n\nfunction isDependencyTask(task) {\n  return /\\b(dependenc(?:y|ies)|package|npm|pnpm|yarn|lockfile|install)\\b/i.test(task || '');\n}\n\n"""
+          if anchor not in s:
+              raise SystemExit('test command anchor not found')
+          s = s.replace(anchor, helper + anchor, 1)
+
+          old_clone = """    setStatus(job, 'cloning', 'cloning repository into isolated workspace');\n    const repoUrl = `https://x-access-token:${encodeURIComponent(process.env.GITHUB_TOKEN)}@github.com/${job.repository}.git`;\n"""
+          new_clone = """    setStatus(job, 'cloning', 'cloning repository into isolated workspace');\n    const repoUrl = `https://x-access-token:${encodeURIComponent(process.env.GITHUB_TOKEN)}@github.com/${job.repository}.git`;\n"""
+          if old_clone not in s:
+              raise SystemExit('clone block not found')
+
+          old_changed = """    setStatus(job, 'editing', 'Gemini produced a plan; applying targeted edits');\n    const changed = await applyEdits(work, plan.edits || []);\n"""
+          new_changed = """    setStatus(job, 'editing', 'Gemini produced a plan; applying targeted edits');\n    const changed = await applyEdits(work, plan.edits || [], isDependencyTask(job.task));\n"""
+          if old_changed not in s:
+              raise SystemExit('edit block not found')
+          s = s.replace(old_changed, new_changed, 1)
+
+          old_validate = """    for (let attempt = 1; attempt <= 3; attempt++) {\n      setStatus(job, 'testing', attempt === 1 ? 'running project tests and build validation' : `validation failed; running repair pass ${attempt - 1}/2`);\n"""
+          new_validate = """    setStatus(job, 'installing', 'installing project dependencies');\n    job.packageManager = await installDependencies(work);\n    if (job.packageManager) log(job, `dependencies ready (${job.packageManager})`);\n\n    for (let attempt = 1; attempt <= 3; attempt++) {\n      setStatus(job, 'testing', attempt === 1 ? 'running project tests and build validation' : `validation failed; running repair pass ${attempt - 1}/2`);\n"""
+          if old_validate not in s:
+              raise SystemExit('validation loop anchor not found')
+          s = s.replace(old_validate, new_validate, 1)
+
+          old_prompt = """Make the smallest safe change. Preserve unrelated functionality. Do not invent files. For research/test/audit tasks, edits may be empty. For code/bug tasks, provide complete contents only for files that must change."""
+          new_prompt = """Make the smallest safe change. Preserve unrelated functionality. Do not invent files. Never modify package.json, package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml, or yarn.lock unless the task explicitly concerns dependencies or package configuration. For research/test/audit tasks, edits may be empty. For code/bug tasks, provide complete contents only for files that must change."""
+          if old_prompt not in s:
+              raise SystemExit('plan prompt not found')
+          s = s.replace(old_prompt, new_prompt, 1)
+
+          repair_prompt_old = """Fix only the failures while preserving the requested behavior and unrelated code. Do not change configuration merely to hide failures."""
+          repair_prompt_new = """Fix only the failures while preserving the requested behavior and unrelated code. Do not change configuration merely to hide failures. Never modify dependency manifests or lockfiles unless the task explicitly concerns dependencies."""
+          if repair_prompt_old in s:
+              s = s.replace(repair_prompt_old, repair_prompt_new, 1)
+
+          s = s.replace("version: '0.5.0'", "version: '0.6.0'", 1)
+          p.write_text(s)
+
+      - name: Validate runtime
+        run: node --check server.js
+
+      - name: Commit patch and remove workflow
+        run: |
+          git config user.name 'Agent 1'
+          git config user.email 'agent-1@users.noreply.github.com'
+          git add server.js
+          git rm .github/workflows/harden-execution.yml
+          git commit -m 'fix: install dependencies before validation and protect manifests'
+          git push
