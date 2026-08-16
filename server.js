@@ -149,13 +149,15 @@ async function readRelevantFiles(root, files) {
   return { selected: selected.map(x => x.file), snapshot: chunks.join('') };
 }
 
-async function applyEdits(root, edits) {
+async function applyEdits(root, edits, allowDependencyFiles = false) {
   const changed = [];
+  const protectedDependency = /(^|\/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock)$/i;
   for (const edit of edits || []) {
     if (!edit?.path || typeof edit.content !== 'string') continue;
     const normalized = path.normalize(edit.path);
     if (normalized.startsWith('..') || path.isAbsolute(normalized)) throw new Error(`Unsafe edit path: ${edit.path}`);
     if (normalized.includes('node_modules') || normalized === '.git') throw new Error(`Blocked edit path: ${edit.path}`);
+    if (protectedDependency.test(normalized) && !allowDependencyFiles) continue;
     const target = path.join(root, normalized);
     await writeFile(target, edit.content, 'utf8');
     changed.push(normalized);
@@ -175,6 +177,29 @@ async function createPr(repository, branch, base, task, summary) {
 async function mergePr(repository, number) {
   const [owner, repo] = repository.split('/');
   return github(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}/merge`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merge_method: 'squash' }) });
+}
+
+async function installDependencies(work) {
+  const exists = async (name) => { try { await readFile(path.join(work, name)); return true; } catch { return false; } };
+  if (!(await exists('package.json'))) return null;
+  if (await exists('pnpm-lock.yaml')) {
+    try { await run('corepack', ['pnpm', 'install', '--frozen-lockfile'], work, 300000); return 'pnpm install --frozen-lockfile'; }
+    catch { await run('npm', ['install'], work, 300000); return 'npm install (fallback)'; }
+  }
+  if (await exists('yarn.lock')) {
+    try { await run('corepack', ['yarn', 'install', '--immutable'], work, 300000); return 'yarn install --immutable'; }
+    catch { await run('npm', ['install'], work, 300000); return 'npm install (fallback)'; }
+  }
+  if (await exists('package-lock.json') || await exists('npm-shrinkwrap.json')) {
+    await run('npm', ['ci'], work, 300000);
+    return 'npm ci';
+  }
+  await run('npm', ['install'], work, 300000);
+  return 'npm install';
+}
+
+function isDependencyTask(task) {
+  return /\b(dependenc(?:y|ies)|package|npm|pnpm|yarn|lockfile|install)\b/i.test(task || '');
 }
 
 function getTestCommands(packageJson) {
@@ -210,7 +235,7 @@ async function repairFromValidation(job, work, files, snapshot, testResults) {
   for (const file of changed) {
     try { changedSnapshot.push(`\n--- CHANGED FILE: ${file} ---\n${await readFile(path.join(work, file), 'utf8')}`); } catch {}
   }
-  const repair = await gemini(`You are Agent 1 repairing your own code change. The project validation failed. Return only structured JSON matching the supplied schema. Fix only the failures while preserving the requested behavior and unrelated code. Do not change configuration merely to hide failures.\n\nTASK: ${job.task}\n\nFAILURES:\n${failures.map(x => `COMMAND: ${x.command}\nOUTPUT:\n${x.output}`).join('\n')}\n\nCHANGED FILES:\n${changedSnapshot.join('')}\n\nREPOSITORY FILES:\n${files.join('\n')}\n\nRELEVANT SNAPSHOT:\n${snapshot}`, repairSchema);
+  const repair = await gemini(`You are Agent 1 repairing your own code change. The project validation failed. Return only structured JSON matching the supplied schema. Fix only the failures while preserving the requested behavior and unrelated code. Do not change configuration merely to hide failures. Never modify dependency manifests or lockfiles unless the task explicitly concerns dependencies.\n\nTASK: ${job.task}\n\nFAILURES:\n${failures.map(x => `COMMAND: ${x.command}\nOUTPUT:\n${x.output}`).join('\n')}\n\nCHANGED FILES:\n${changedSnapshot.join('')}\n\nREPOSITORY FILES:\n${files.join('\n')}\n\nRELEVANT SNAPSHOT:\n${snapshot}`, repairSchema);
   const repaired = await applyEdits(work, repair.edits || []);
   if (repaired.length) job.changedFiles = [...new Set([...changed, ...repaired])];
   job.repair = { summary: repair.summary || 'Applied a validation repair pass.', confidence: repair.confidence ?? null, files: repaired };
@@ -232,7 +257,7 @@ async function executeJob(job) {
     setStatus(job, 'analyzing', `analyzing repository structure and relevant source files (${files.length} files)`);
     job.fileCount = files.length;
     const snapshotData = await readRelevantFiles(work, files);
-    const plan = await gemini(`You are Agent 1, a careful senior software engineer. Analyze this repository snapshot and the user's task. Return only structured JSON matching the supplied schema. Make the smallest safe change. Preserve unrelated functionality. Do not invent files. For research/test/audit tasks, edits may be empty. For code/bug tasks, provide complete contents only for files that must change.\n\nMODE: ${job.mode}\nTASK: ${job.task}\n\nREPOSITORY FILE LIST:\n${files.join('\n')}\n\nRELEVANT FILE SNAPSHOT:\n${snapshotData.snapshot}`, planSchema);
+    const plan = await gemini(`You are Agent 1, a careful senior software engineer. Analyze this repository snapshot and the user's task. Return only structured JSON matching the supplied schema. Make the smallest safe change. Preserve unrelated functionality. Do not invent files. Never modify package.json, package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml, or yarn.lock unless the task explicitly concerns dependencies or package configuration. For research/test/audit tasks, edits may be empty. For code/bug tasks, provide complete contents only for files that must change.\n\nMODE: ${job.mode}\nTASK: ${job.task}\n\nREPOSITORY FILE LIST:\n${files.join('\n')}\n\nRELEVANT FILE SNAPSHOT:\n${snapshotData.snapshot}`, planSchema);
     job.plan = { summary: plan.summary, risks: plan.risks || [], relevantFiles: plan.relevantFiles || [], confidence: plan.confidence ?? null };
 
     if (job.action === 'analyze') {
@@ -241,12 +266,16 @@ async function executeJob(job) {
     }
 
     setStatus(job, 'editing', 'Gemini produced a plan; applying targeted edits');
-    const changed = await applyEdits(work, plan.edits || []);
+    const changed = await applyEdits(work, plan.edits || [], isDependencyTask(job.task));
     job.changedFiles = changed;
     if (!changed.length) {
       setStatus(job, 'analysis_complete', 'no changes were required; no branch or pull request created');
       return;
     }
+
+    setStatus(job, 'installing', 'installing project dependencies');
+    job.packageManager = await installDependencies(work);
+    if (job.packageManager) log(job, `dependencies ready (${job.packageManager})`);
 
     for (let attempt = 1; attempt <= 3; attempt++) {
       setStatus(job, 'testing', attempt === 1 ? 'running project tests and build validation' : `validation failed; running repair pass ${attempt - 1}/2`);
@@ -282,7 +311,7 @@ async function executeJob(job) {
   }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'agent-1', version: '0.5.0' }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'agent-1', version: '0.6.0' }));
 app.get('/api/config', auth, (_req, res) => res.json({ modes, actions: [{ id: 'analyze', label: 'Analyze' }, { id: 'preview', label: 'Implement + Preview' }, { id: 'publish', label: 'Approve → Main' }], integrations: { github: Boolean(process.env.GITHUB_TOKEN), gemini: Boolean(process.env.GEMINI_API_KEY), render: Boolean(process.env.RENDER_API_KEY) } }));
 
 app.get('/api/repositories', auth, async (_req, res) => {
