@@ -35,7 +35,7 @@ const planSchema = {
     summary: { type: 'string' },
     risks: { type: 'array', items: { type: 'string' } },
     relevantFiles: { type: 'array', items: { type: 'string' } },
-    edits: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'], additionalProperties: false } },
+    edits: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
     tests: { type: 'array', items: { type: 'string' } },
     confidence: { type: 'number', minimum: 0, maximum: 1 }
   },
@@ -47,7 +47,7 @@ const repairSchema = {
   type: 'object',
   properties: {
     summary: { type: 'string' },
-    edits: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'], additionalProperties: false } },
+    edits: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
     risks: { type: 'array', items: { type: 'string' } },
     confidence: { type: 'number', minimum: 0, maximum: 1 }
   },
