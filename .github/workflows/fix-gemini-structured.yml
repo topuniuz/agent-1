@@ -1,0 +1,86 @@
+name: Fix Gemini structured output
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch server
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('server.js')
+          s = p.read_text()
+          start = s.index('async function gemini(')
+          end = s.index('\n\nasync function run(', start)
+          schemas = '''const PLAN_SCHEMA = {
+            type: 'OBJECT',
+            properties: {
+              summary: { type: 'STRING' },
+              risks: { type: 'ARRAY', items: { type: 'STRING' } },
+              relevantFiles: { type: 'ARRAY', items: { type: 'STRING' } },
+              edits: { type: 'ARRAY', items: { type: 'OBJECT', properties: { path: { type: 'STRING' }, content: { type: 'STRING' } }, required: ['path', 'content'] } },
+              tests: { type: 'ARRAY', items: { type: 'STRING' } },
+              confidence: { type: 'NUMBER' }
+            },
+            required: ['summary', 'risks', 'relevantFiles', 'edits', 'tests', 'confidence']
+          };
+
+          const REPAIR_SCHEMA = {
+            type: 'OBJECT',
+            properties: {
+              summary: { type: 'STRING' },
+              edits: { type: 'ARRAY', items: { type: 'OBJECT', properties: { path: { type: 'STRING' }, content: { type: 'STRING' } }, required: ['path', 'content'] } },
+              risks: { type: 'ARRAY', items: { type: 'STRING' } },
+              confidence: { type: 'NUMBER' }
+            },
+            required: ['summary', 'edits', 'risks', 'confidence']
+          };
+
+          async function gemini(prompt, schema) {
+            const model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+            const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+            const body = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', responseSchema: schema } };
+            async function request(payload) {
+              const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY }, body: JSON.stringify(payload) });
+              const data = await response.json();
+              if (!response.ok) throw new Error(data.error?.message || `Gemini request failed (${response.status})`);
+              const text = data.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
+              if (!text) throw new Error('Gemini returned no usable response.');
+              try { return JSON.parse(text); } catch { return null; }
+            }
+            const first = await request(body);
+            if (first) return first;
+            const retry = await request({ ...body, contents: [{ parts: [{ text: `${prompt}\n\nReturn only the structured JSON object. No markdown, no code fences, no commentary.` }] }] });
+            if (retry) return retry;
+            throw new Error('The AI response could not be read. Agent 1 will not modify the repository.');
+          }
+          '''
+          s = s[:start] + schemas + s[end:]
+          repair_start = s.index('const repair = await gemini(')
+          repair_marker = "${snapshot}`);"
+          ridx = s.index(repair_marker, repair_start) + len(repair_marker)
+          s = s[:ridx-2] + " , REPAIR_SCHEMA);" + s[ridx:]
+          plan_start = s.index('const plan = await gemini(')
+          plan_marker = "${snapshotData.snapshot}`);"
+          pidx = s.index(plan_marker, plan_start) + len(plan_marker)
+          s = s[:pidx-2] + " , PLAN_SCHEMA);" + s[pidx:]
+          p.write_text(s)
+      - name: Validate server
+        run: node --check server.js
+      - name: Commit patch and remove workflow
+        run: |
+          git config user.name 'Agent 1'
+          git config user.email 'agent-1@users.noreply.github.com'
+          git add server.js
+          git rm .github/workflows/fix-gemini-structured.yml
+          git commit -m 'fix: use compatible Gemini structured outputs'
+          git push
