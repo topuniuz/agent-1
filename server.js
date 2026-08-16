@@ -29,6 +29,32 @@ const modes = [
   { id: 'audit', label: 'Audit', description: 'Review architecture, security, UX, data, and technical debt.' }
 ];
 
+const planSchema = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    risks: { type: 'array', items: { type: 'string' } },
+    relevantFiles: { type: 'array', items: { type: 'string' } },
+    edits: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'], additionalProperties: false } },
+    tests: { type: 'array', items: { type: 'string' } },
+    confidence: { type: 'number', minimum: 0, maximum: 1 }
+  },
+  required: ['summary', 'risks', 'relevantFiles', 'edits', 'tests', 'confidence'],
+  additionalProperties: false
+};
+
+const repairSchema = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    edits: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'], additionalProperties: false } },
+    risks: { type: 'array', items: { type: 'string' } },
+    confidence: { type: 'number', minimum: 0, maximum: 1 }
+  },
+  required: ['summary', 'edits', 'risks', 'confidence'],
+  additionalProperties: false
+};
+
 function requireIntegrations(res) {
   const missing = [];
   if (!process.env.GITHUB_TOKEN) missing.push('GITHUB_TOKEN');
@@ -51,26 +77,44 @@ async function github(apiPath, options = {}) {
     }
   });
   const text = await response.text();
-  let data; try { data = JSON.parse(text); } catch { data = { message: text }; }
+  let data;
+  try { data = JSON.parse(text); } catch { data = { message: text }; }
   if (!response.ok) throw new Error(data.message || `GitHub request failed (${response.status})`);
   return data;
 }
 
-async function gemini(prompt) {
-  const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { responseMimeType: 'application/json' }
-    })
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error?.message || `Gemini request failed (${response.status})`);
-  const text = data.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
-  if (!text) throw new Error('Gemini returned no usable response.');
-  try { return JSON.parse(text); } catch { throw new Error('Gemini returned invalid JSON.'); }
+async function gemini(prompt, schema) {
+  const model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+  const makeRequest = async (extraPrompt = '') => {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: `${prompt}${extraPrompt}` }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: schema
+        }
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || `Gemini request failed (${response.status})`);
+    const text = data.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
+    if (!text) throw new Error('Gemini returned no usable response.');
+    return { data, text };
+  };
+
+  let result = await makeRequest();
+  try {
+    return JSON.parse(result.text);
+  } catch {
+    result = await makeRequest('\n\nIMPORTANT: return ONLY a valid JSON object matching the response schema. Do not include markdown, code fences, or commentary.');
+    try {
+      return JSON.parse(result.text);
+    } catch {
+      throw new Error('Gemini returned invalid structured output after retry.');
+    }
+  }
 }
 
 async function run(cmd, args, cwd, timeout = 120000) {
@@ -101,7 +145,7 @@ async function collectFiles(root) {
 
 async function readRelevantFiles(root, files) {
   const ranked = files.map(file => ({ file, score: /(^|\/)(package\.json|vite\.config|next\.config|src\/|app\/|pages\/|server|README|supabase|\.github\/)/i.test(file) ? 2 : 1 }));
-  ranked.sort((a,b) => b.score-a.score || a.file.length-b.file.length);
+  ranked.sort((a, b) => b.score - a.score || a.file.length - b.file.length);
   const selected = ranked.slice(0, 100);
   let total = 0;
   const chunks = [];
@@ -134,7 +178,8 @@ async function applyEdits(root, edits) {
 async function createPr(repository, branch, base, task, summary) {
   const [owner, repo] = repository.split('/');
   return github(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       title: `Agent 1: ${task.slice(0, 70)}`,
       head: branch,
@@ -148,7 +193,8 @@ async function createPr(repository, branch, base, task, summary) {
 async function mergePr(repository, number) {
   const [owner, repo] = repository.split('/');
   return github(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}/merge`, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ merge_method: 'squash' })
   });
 }
@@ -186,7 +232,7 @@ async function repairFromValidation(job, work, files, snapshot, testResults) {
   for (const file of changed) {
     try { changedSnapshot.push(`\n--- CHANGED FILE: ${file} ---\n${await readFile(path.join(work, file), 'utf8')}`); } catch {}
   }
-  const repair = await gemini(`You are Agent 1 repairing your own code change. The project validation failed. Return JSON only with keys: summary, edits (array of {path, content}), risks, confidence. Fix only the failures while preserving the requested behavior and unrelated code. Do not change configuration merely to hide failures.\n\nTASK: ${job.task}\n\nFAILURES:\n${failures.map(x => `COMMAND: ${x.command}\nOUTPUT:\n${x.output}`).join('\n')}\n\nCHANGED FILES:\n${changedSnapshot.join('')}\n\nREPOSITORY FILES:\n${files.join('\n')}\n\nRELEVANT SNAPSHOT:\n${snapshot}`);
+  const repair = await gemini(`You are Agent 1 repairing your own code change. The project validation failed. Return only structured JSON matching the supplied schema. Fix only the failures while preserving the requested behavior and unrelated code. Do not change configuration merely to hide failures.\n\nTASK: ${job.task}\n\nFAILURES:\n${failures.map(x => `COMMAND: ${x.command}\nOUTPUT:\n${x.output}`).join('\n')}\n\nCHANGED FILES:\n${changedSnapshot.join('')}\n\nREPOSITORY FILES:\n${files.join('\n')}\n\nRELEVANT SNAPSHOT:\n${snapshot}`, repairSchema);
   const repaired = await applyEdits(work, repair.edits || []);
   if (repaired.length) job.changedFiles = [...new Set([...changed, ...repaired])];
   job.repair = { summary: repair.summary || 'Applied a validation repair pass.', confidence: repair.confidence ?? null, files: repaired };
@@ -208,7 +254,7 @@ async function executeJob(job) {
     setStatus(job, 'analyzing', `analyzing repository structure and relevant source files (${files.length} files)`);
     job.fileCount = files.length;
     const snapshotData = await readRelevantFiles(work, files);
-    const plan = await gemini(`You are Agent 1, a careful senior software engineer. Analyze this repository snapshot and the user's task. Return JSON only with keys: summary (string), risks (array of strings), relevantFiles (array of strings), edits (array of objects with path and content), tests (array of strings), confidence (number 0-1). Make the smallest safe change. Preserve unrelated functionality. Do not invent files. For research/test/audit tasks, edits may be empty. For code/bug tasks, provide complete contents only for files that must change.\n\nMODE: ${job.mode}\nTASK: ${job.task}\n\nREPOSITORY FILE LIST:\n${files.join('\n')}\n\nRELEVANT FILE SNAPSHOT:\n${snapshotData.snapshot}`);
+    const plan = await gemini(`You are Agent 1, a careful senior software engineer. Analyze this repository snapshot and the user's task. Return only structured JSON matching the supplied schema. Make the smallest safe change. Preserve unrelated functionality. Do not invent files. For research/test/audit tasks, edits may be empty. For code/bug tasks, provide complete contents only for files that must change.\n\nMODE: ${job.mode}\nTASK: ${job.task}\n\nREPOSITORY FILE LIST:\n${files.join('\n')}\n\nRELEVANT FILE SNAPSHOT:\n${snapshotData.snapshot}`, planSchema);
     job.plan = { summary: plan.summary, risks: plan.risks || [], relevantFiles: plan.relevantFiles || [], confidence: plan.confidence ?? null };
 
     if (job.action === 'analyze') {
@@ -256,7 +302,7 @@ async function executeJob(job) {
   }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'agent-1', version: '0.4.0' }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'agent-1', version: '0.5.0' }));
 app.get('/api/config', auth, (_req, res) => res.json({
   modes,
   actions: [
@@ -317,7 +363,8 @@ app.post('/api/jobs/:id/approve', auth, async (req, res) => {
 app.post('/api/jobs/:id/cancel', auth, async (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found.' });
-  job.status = 'cancelled'; job.updatedAt = Date.now();
+  job.status = 'cancelled';
+  job.updatedAt = Date.now();
   log(job, 'job cancelled');
   if (job.pr?.number) {
     try { await github(`/repos/${job.repository}/pulls/${job.pr.number}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state: 'closed' }) }); } catch {}
@@ -329,11 +376,15 @@ app.post('/api/jobs/:id/revise', auth, async (req, res) => {
   const job = jobs.get(req.params.id);
   const instruction = req.body?.instruction;
   if (!job || !instruction) return res.status(400).json({ error: 'Job and revision instruction are required.' });
-  if (job.pr?.number) { try { await github(`/repos/${job.repository}/pulls/${job.pr.number}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state: 'closed' }) }); } catch {} }
+  if (job.pr?.number) {
+    try { await github(`/repos/${job.repository}/pulls/${job.pr.number}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state: 'closed' }) }); } catch {}
+  }
   const next = { mode: job.mode, repository: job.repository, action: 'preview', task: `${job.task}\n\nREVISION REQUEST:\n${String(instruction).slice(0, 5000)}` };
   const id = crypto.randomUUID();
   const fresh = { id, ...next, status: 'queued', createdAt: Date.now(), updatedAt: Date.now(), events: [] };
-  jobs.set(id, fresh); log(fresh, 'revision accepted'); executeJob(fresh);
+  jobs.set(id, fresh);
+  log(fresh, 'revision accepted');
+  executeJob(fresh);
   res.status(202).json({ jobId: id, message: 'Revision started.' });
 });
 
